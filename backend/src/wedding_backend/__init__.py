@@ -1,0 +1,1 @@
+"""Wedding backend package placeholder."""
