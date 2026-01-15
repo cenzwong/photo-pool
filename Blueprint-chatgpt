@@ -1,0 +1,354 @@
+Wedding Photo “Pick-a-Face” System — DynamoDB + Incremental Rebuild (Option A2)
+
+This doc is your future vibe-coding blueprint: what you’re building, why it’s cheap, and exactly how the pieces talk to each other.
+
+⸻
+
+1. Goal
+
+A wedding website where guests can:
+	•	Upload photos/videos
+	•	See a People page with face clusters (tap a face cluster to claim “this is me”)
+	•	Download all photos containing that person
+
+Constraints:
+	•	Minimum deployment cost
+	•	Low concurrency (small crowd)
+	•	Prefer Python for backend logic
+	•	Avoid heavy web dev (frontend should be dumb)
+
+⸻
+
+2. High-Level Architecture
+
+Frontend
+	•	GitHub Pages (static site)
+	•	Upload UI
+	•	People page UI (clusters + photo list)
+	•	Talks to backend via HTTPS (API Gateway)
+
+Backend (serverless)
+	•	S3: raw media + face thumbnails
+	•	API Gateway: REST endpoints
+	•	Lambda (Python):
+	•	Generate presigned S3 URLs
+	•	Process uploads (detect/index faces, crop thumbnails)
+	•	Incremental cluster rebuild job
+	•	Rekognition:
+	•	IndexFaces into a Collection
+	•	SearchFaces for similarity graph edges
+	•	DynamoDB: metadata + cluster state (fast queries)
+
+Videos: store/upload/download via S3; face clustering applies to photos (MVP). Keep video face analysis as phase 2.
+
+⸻
+
+3. Core Idea: Incremental Rebuild (Option A2)
+
+We avoid “live merging complexity” but also avoid stale indexes by doing:
+	•	Continuous indexing on every photo upload → faces are immediately stored (FaceOccurrence)
+	•	A scheduled Incremental Rebuild (every 2–5 minutes during event)
+	•	Processes only new faces since last checkpoint
+	•	Assigns them to existing clusters (or creates new clusters)
+	•	Updates summary counts + ClusterPhoto mapping
+	•	A less frequent Full Rebuild (manual or hourly)
+	•	Handles merges/splits for better quality (optional but recommended)
+
+This makes the People page feel near-real-time without building a gnarly streaming cluster merger.
+
+⸻
+
+4. Data Model (DynamoDB)
+
+4.1 Photo table
+
+PK: photoId (UUID)
+
+Attributes:
+	•	s3KeyRaw
+	•	uploadedAt
+	•	status: RAW | INDEXED | FAILED
+	•	faceCount
+	•	optional: uploaderTag, fileType, etag
+
+Purpose:
+	•	Map photoId → S3 key quickly
+	•	Debug/retry
+
+⸻
+
+4.2 FaceOccurrence table
+
+Represents “face X appears in photo Y”.
+
+PK: faceId (Rekognition FaceId)
+SK: photoId
+
+Attributes:
+	•	thumbS3Key (e.g., faces/thumbs/{faceId}.jpg)
+	•	bbox
+	•	confidence
+	•	indexedAt (ISO time)
+
+GSI1 (reverse lookup):
+	•	GSI1PK = photoId
+	•	GSI1SK = faceId
+
+Purpose:
+	•	Find all photos for a face (PK query)
+	•	Find all faces in a photo (GSI1 query)
+	•	Provide indexedAt for incremental rebuild (via scan/GSI strategy below)
+
+⸻
+
+4.3 Cluster table
+
+PK: clusterId
+
+Attributes:
+	•	repFaceId
+	•	repThumbS3Key
+	•	memberCount
+	•	photoCount
+	•	updatedAt
+	•	optional: canonicalClusterId (used if you later implement merges/redirects)
+
+Purpose:
+	•	Cheap GET /clusters (scan is small ~10–50 items)
+
+⸻
+
+4.4 ClusterMember table
+
+PK: clusterId
+SK: faceId
+
+GSI1 (face → cluster):
+	•	GSI1PK = faceId
+	•	GSI1SK = clusterId
+
+Purpose:
+	•	For a new face, find which cluster(s) its matched faces belong to.
+
+⸻
+
+4.5 ClusterPhoto table (recommended)
+
+PK: clusterId
+SK: photoId
+
+Attributes:
+	•	bestFaceId (optional; face in that photo to highlight)
+	•	addedAt
+
+Purpose:
+	•	Clicking a cluster should be a single DynamoDB Query.
+
+⸻
+
+4.6 JobState table (or a single item)
+
+PK: jobName (e.g., "incremental-cluster-rebuild")
+
+Attributes:
+	•	lastProcessedAt (checkpoint)
+	•	lastRunAt
+	•	status, stats
+
+Purpose:
+	•	Avoid reprocessing everything.
+
+⸻
+
+5. S3 Layout
+	•	Raw uploads:
+	•	uploads/raw/{photoId}.jpg
+	•	uploads/raw/{photoId}.heic (optional)
+	•	uploads/raw/{videoId}.mp4
+	•	Face thumbnails (small):
+	•	faces/thumbs/{faceId}.jpg
+
+Keep bucket private. Only use presigned URLs.
+
+⸻
+
+6. Processing Pipeline
+
+6.1 Upload flow (client)
+	1.	Client calls GET /presign-upload?type=image/jpeg&ext=jpg
+	2.	Backend returns photoId + presigned PUT URL + S3 key
+	3.	Client uploads directly to S3 using PUT
+	4.	Client calls POST /finalize-upload with photoId (optional but recommended)
+	•	This avoids relying purely on S3 events for correctness
+
+⸻
+
+6.2 Indexing flow (Lambda, Python)
+
+Triggered by either:
+	•	S3 ObjectCreated event on uploads/raw/
+	•	or POST /finalize-upload (you can do both, but ensure idempotency)
+
+Steps:
+	1.	Write/Update Photo(photoId) → status=RAW
+	2.	Call Rekognition IndexFaces into Collection
+	3.	For each detected face:
+	•	Crop thumbnail and write faces/thumbs/{faceId}.jpg to S3
+	•	Put item into FaceOccurrence(faceId, photoId) including indexedAt
+	4.	Update Photo → status=INDEXED, faceCount=N
+
+⸻
+
+7. Incremental Rebuild Job (the heart)
+
+7.1 Scheduling
+	•	During wedding window: every 2–5 minutes
+	•	After: hourly or manual
+Use EventBridge schedule to invoke incremental_rebuild_lambda.
+
+⸻
+
+7.2 How to get “new faces since checkpoint”
+
+You need an efficient way to list new FaceIds since lastProcessedAt.
+
+Two practical approaches:
+
+A) Dedicated FaceIngest table (cleanest)
+	•	On every IndexFaces, write:
+	•	FaceIngest with PK=dayBucket (e.g. 2026-01-15), SK=indexedAt#faceId
+	•	Then incremental job queries by day bucket + range.
+
+B) Use FaceOccurrence + scan (acceptable at wedding scale)
+	•	If total face count is small (few thousand), a scan with filter on indexedAt > lastProcessedAt is fine.
+	•	Cheapest to implement, but not “infinite scale”.
+
+Given your scale, B is fine; A is nicer if you want it clean.
+
+⸻
+
+7.3 Assignment logic (incremental)
+
+For each new faceId:
+	1.	Find similar faces:
+	•	Rekognition SearchFaces (collection) using faceId
+	•	Keep matches above threshold (e.g., 90+; tune later)
+	2.	For each matched mFaceId, find its cluster:
+	•	Query ClusterMember GSI1 where faceId = mFaceId
+	•	Collect candidate clusterIds
+	3.	Choose target cluster:
+	•	If no candidates → create new clusterId
+	•	If one candidate → use it
+	•	If multiple candidates:
+	•	Incremental job chooses one canonical cluster (e.g., smallest clusterId)
+	•	Add faceId to canonical cluster
+	•	Record “mergeNeeded” flag somewhere (JobState / Cluster table) for later Full Rebuild
+	•	(This keeps incremental job simple and stable)
+	4.	Update DynamoDB:
+	•	Put ClusterMember(clusterId, faceId)
+	•	Update Cluster.memberCount += 1
+	•	Choose/update Cluster.repFaceId if needed (optional heuristic below)
+	5.	Add photos to ClusterPhoto:
+	•	Query FaceOccurrence for this faceId → yields photoIds
+	•	For each photoId: Put ClusterPhoto(clusterId, photoId) (idempotent upsert)
+	•	Update Cluster.photoCount (approx ok; or compute later)
+	6.	Update checkpoint:
+	•	JobState.lastProcessedAt = max(indexedAt processed)
+
+⸻
+
+7.4 Representative thumbnail heuristic
+
+Keep it simple:
+	•	First face in cluster becomes representative
+	•	Or choose the face with highest confidence / largest bbox area
+Store:
+	•	Cluster.repFaceId, Cluster.repThumbS3Key
+
+⸻
+
+8. API Endpoints
+
+Public endpoints
+	•	GET /presign-upload
+	•	returns {id, putUrl, s3Key}
+	•	POST /finalize-upload
+	•	body {photoId} (optional but recommended)
+	•	GET /clusters
+	•	returns clusters with presigned thumb URLs
+	•	GET /clusters/{clusterId}/photos
+	•	returns list of photos (presigned GET URLs)
+
+Admin endpoints (protected by a secret or IAM)
+	•	POST /rebuild/incremental (mostly for testing; scheduled normally)
+	•	POST /rebuild/full (optional, better clustering quality)
+	•	GET /admin/stats (optional)
+
+⸻
+
+9. Freshness Guarantees
+
+With incremental rebuild every 2–5 minutes:
+	•	New faces appear in People page typically within a few minutes
+	•	No heavy S3 index files
+	•	Reads are simple and fast:
+	•	GET /clusters → scan small Cluster table
+	•	click cluster → query ClusterPhoto
+
+Staleness is controlled by schedule, not by “index file drift”.
+
+⸻
+
+10. Security Model
+	•	S3 bucket private
+	•	Only allow uploads via presigned URLs (prefix restricted)
+	•	API protected by:
+	•	wedding passcode (simple) + rate limiting
+	•	optionally CloudFront + WAF later (probably unnecessary)
+	•	Separate admin secret for rebuild triggers
+
+⸻
+
+11. Cost Control Knobs
+	•	Thumbnail size small (e.g., 160×160 JPEG)
+	•	EventBridge schedule only during wedding window
+	•	DynamoDB on-demand (tiny usage)
+	•	S3 lifecycle: delete after N days (e.g., 120)
+	•	Cap file sizes + count per upload batch
+
+⸻
+
+12. “Full Rebuild” (optional but recommended)
+
+Run occasionally to improve cluster quality and handle merges properly:
+	•	Recompute clustering from all faces (union-find over Rekognition similarity)
+	•	Rewrite Cluster, ClusterMember, ClusterPhoto from scratch
+	•	This can be manual (“Admin button”) after the wedding
+
+⸻
+
+13. Minimal Implementation Checklist
+	1.	Create S3 bucket + CORS for uploads
+	2.	Create Rekognition Collection
+	3.	Create DynamoDB tables: Photo, FaceOccurrence, Cluster, ClusterMember, ClusterPhoto, JobState
+	4.	Deploy Lambdas:
+	•	presign_upload
+	•	finalize_or_s3_event_processor (index faces + thumbs + write FaceOccurrence)
+	•	incremental_rebuild
+	5.	Create API Gateway routes
+	6.	Create GitHub Pages UI:
+	•	upload page
+	•	People page (clusters + click → photos)
+	7.	Set EventBridge schedule during wedding window
+
+⸻
+
+14. Notes for Future You (vibe coding warnings 😄)
+	•	Idempotency matters: S3 events can duplicate; your writes should be safe to replay.
+	•	Keep thresholds configurable (env var): similarity threshold strongly affects clustering.
+	•	If incremental job starts accumulating “mergeNeeded” flags, run full rebuild.
+	•	Don’t over-optimize early; wedding scale is forgiving.
+
+⸻
+
+If you want, I can also draft the exact DynamoDB item shapes (example JSON records) and the incremental rebuild pseudo-code in Python (structured for Lambda), so you can straight-up implement it with minimal thinking.
